@@ -150,17 +150,22 @@ class Simulator:
         self.max_time = max_time
         self.stop_at_exit = stop_at_exit
 
-    def _is_coil_engaged(self, x: float, coil: Coil) -> bool:
-        """Check if capsule position x is within coil's active span."""
-        return (x >= coil.start) and (x <= coil.end)
+    # In Simulator class
+
+    def _is_coil_engaged(self, x: float, coil) -> bool:
+        """Return True if position x is within the coil's active span."""
+        eps = 1e-12
+        left = coil.center - coil.length / 2.0
+        right = coil.center + coil.length / 2.0
+        return (left - eps) <= x <= (right + eps)
 
     def _total_force(self, x: float) -> float:
-        """Calculate total force from all engaged coils at position x."""
-        total_force = 0.0
+        """Sum constant forces from all coils whose spans contain x."""
+        F = 0.0
         for coil in self.coils:
             if self._is_coil_engaged(x, coil):
-                total_force += coil.force
-        return total_force
+                F += coil.force  # positive = forward thrust
+        return F
 
     def _calculate_theoretical_work_done(self) -> float:
         """
@@ -179,35 +184,36 @@ class Simulator:
         return total_work
 
     def run(self) -> SimulationResult:
-        """Run the simulation and return results."""
+        """Run the simulation and return results (pos & acc aligned at the same instant)."""
         m = self.capsule.mass
         dt = self.dt
         tube_length = self.tube.length
 
-        # Initial conditions
+        # Initial state
         t = 0.0
         x = self.capsule.x0
         v = self.capsule.v0
 
-        # Storage for results
+        # Output arrays
         times, positions, velocities, accelerations = [], [], [], []
         kinetic_energies, forces_applied, power_consumption = [], [], []
         events: List[Dict[str, Any]] = []
 
-        # Track coil engagement for event logging
+        # Event tracking
         previously_engaged = [False] * len(self.coils)
         t_exit = None
         has_exited = False
 
+        # Helper to compute total force at a position (with tiny tolerance when used by _is_coil_engaged)
+        def total_force_at(pos: float) -> float:
+            return self._total_force(pos) if pos < tube_length else 0.0
+
         while t <= self.max_time:
-            # Stop early if requested and capsule has exited tube
+            # Early stop after exit if requested
             if self.stop_at_exit and has_exited:
                 break
 
-            # Check if we're still inside the tube
-            inside_tube = x < tube_length
-
-            # Record exit time when capsule first exits
+            # Exit event detection at CURRENT x (before stepping)
             if not has_exited and x >= tube_length:
                 t_exit = t
                 has_exited = True
@@ -218,12 +224,20 @@ class Simulator:
                     "velocity": v,
                 })
 
-            # Calculate acceleration based on current position
-            if inside_tube:
-                total_force = self._total_force(x)
-                acceleration = total_force / m
+            # ---- integration step (semi-implicit Euler) using acceleration at CURRENT x ----
+            F_now = total_force_at(x)
+            a_now = F_now / m
+            v = v + a_now * dt
+            x = x + v * dt
+            t = t + dt
+            # -----------------------------------------------------------------------------
 
-                # Log coil engagement events
+            # Recompute force/acceleration at the NEW position so recordings match position
+            F_rec = total_force_at(x)
+            a_rec = F_rec / m
+
+            # Coil engagement events based on NEW position (which we are recording)
+            if x < tube_length:
                 for i, coil in enumerate(self.coils):
                     engaged = self._is_coil_engaged(x, coil)
                     if engaged and not previously_engaged[i]:
@@ -242,55 +256,42 @@ class Simulator:
                             "position": x,
                         })
                     previously_engaged[i] = engaged
-            else:
-                # Outside tube - no acceleration
-                acceleration = 0.0
-                total_force = 0.0
 
-            # Semi-implicit Euler integration
-            v = v + acceleration * dt  # Update velocity first
-            x = x + v * dt  # Then update position
-
-            # Calculate energy and power metrics
-            kinetic_energy = 0.5 * m * v ** 2
-            power = total_force * v  # Instantaneous power (Force × velocity)
-
-            # Record this time step
+            # ---- record (position, acceleration, etc. are from the SAME instant/position) ----
             times.append(t)
             positions.append(x)
             velocities.append(v)
-            accelerations.append(acceleration)
-            kinetic_energies.append(kinetic_energy)
-            forces_applied.append(total_force)
+            accelerations.append(a_rec)
+
+            ke = 0.5 * m * v * v
+            power = F_rec * v
+            kinetic_energies.append(ke)
+            forces_applied.append(F_rec)
             power_consumption.append(power)
+            # -------------------------------------------------------------------------------
 
-            t += dt
-
-        # Calculate energy metrics
+        # Energy metrics
         initial_ke = 0.5 * m * self.capsule.v0 ** 2
         final_ke = kinetic_energies[-1] if kinetic_energies else initial_ke
         energy_gained = final_ke - initial_ke
 
-        # Calculate work done by coils (theoretical)
         theoretical_work = self._calculate_theoretical_work_done()
-
-        # Calculate efficiency - handle division by zero
-        if theoretical_work > 1e-12:  # Avoid division by zero
-            efficiency = (energy_gained / theoretical_work * 100)
+        if theoretical_work > 1e-12:
+            efficiency = (energy_gained / theoretical_work) * 100.0
         else:
             efficiency = 0.0 if abs(energy_gained) < 1e-12 else 100.0
 
-        # Find maximum values
+        # Peaks
         max_acceleration = max(accelerations) if accelerations else 0.0
         max_force = max(forces_applied) if forces_applied else 0.0
         max_power = max(power_consumption) if power_consumption else 0.0
 
-        # Calculate average power during acceleration phase
-        if t_exit and len(power_consumption) > 0:
+        # Average power during acceleration (until exit if known)
+        if t_exit is not None and power_consumption:
             exit_idx = min(len(times) - 1, int(t_exit / dt))
-            avg_power_accel = sum(power_consumption[:exit_idx + 1]) / (exit_idx + 1) if exit_idx >= 0 else 0.0
+            avg_power_accel = (sum(power_consumption[:exit_idx + 1]) / (exit_idx + 1)) if exit_idx >= 0 else 0.0
         else:
-            avg_power_accel = sum(power_consumption) / len(power_consumption) if power_consumption else 0.0
+            avg_power_accel = (sum(power_consumption) / len(power_consumption)) if power_consumption else 0.0
 
         return SimulationResult(
             time=np.asarray(times, dtype=float),
@@ -323,7 +324,7 @@ class Simulator:
                 "max_force_n": max_force,
                 "max_power_w": max_power,
                 "avg_power_during_accel_w": avg_power_accel,
-                # Additional arrays for detailed analysis
+                # Traces
                 "kinetic_energy_j": kinetic_energies,
                 "force_applied_n": forces_applied,
                 "power_consumption_w": power_consumption,
