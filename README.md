@@ -47,7 +47,7 @@ A 1D electromagnetic capsule acceleration simulation service with REST API, buil
 
 ```bash
 # Clone repository
-git clone <your-repo-url>
+git clone <https://github.com/BenjaminBenHarosh/Moonshot_Space>
 cd Moonshot_Space
 
 # Build and run with Docker Compose
